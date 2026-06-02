@@ -528,7 +528,80 @@ function getDb(registry: any): any | null {
     // Table already exists or db is read-only — that's fine
   }
 
+  // ─── #2256-followup: rescue agentdb.embedder when its transformers.js
+  // path fell through to mock embeddings.
+  //
+  // What was happening: agentdb's `EmbeddingService.initialize()` always
+  // tries `@xenova/transformers` first, which transitively requires `sharp`
+  // → `libvips`. On macOS arm64 systems without `brew install vips`, sharp
+  // fails to load and agentdb silently falls back to MOCK EMBEDDINGS
+  // (random vectors). The bridge then calls `agentdb.embedder.embed(...)`
+  // and gets garbage; semantic search returns no useful matches.
+  //
+  // In our process, `memory-initializer.ts::loadEmbeddingModel()` already
+  // tried this same chain and ALSO has a working ruvector-ONNX fallback
+  // that the user typically reaches before the bridge initialises. The
+  // ruvector ONNX model has been loaded; the agentdb instance just doesn't
+  // know about it. We monkey-patch `embed`/`embedBatch` to delegate to our
+  // `generateEmbedding()` so the bridge gets real vectors.
+  //
+  // Detection signal: `embedder.pipeline === null` after init means
+  // transformers failed and agentdb would otherwise use mockEmbedding().
+  // Patch is idempotent (`__ruvectorRescued` sentinel) and a no-op if
+  // ruvector is also unavailable.
+  rescueAgentdbEmbedder(agentdb).catch(() => { /* non-fatal */ });
+
   return { db, agentdb };
+}
+
+// One-shot guard so we only patch once per process — the embedder is shared
+// by ReflexionMemory/SkillLibrary/CausalRecall and they all see the same
+// object reference.
+let _embedderPatched = false;
+async function rescueAgentdbEmbedder(agentdb: { embedder?: { pipeline?: unknown; embed?: (t: string) => Promise<Float32Array>; embedBatch?: (ts: string[]) => Promise<Float32Array[]>; __ruvectorRescued?: boolean } }): Promise<void> {
+  if (_embedderPatched) return;
+  const emb = agentdb?.embedder;
+  if (!emb || emb.__ruvectorRescued) return;
+
+  // Only rescue when transformers.js initialisation failed: that's
+  // signalled by a null pipeline. If transformers IS working, agentdb's
+  // own embed() does the right thing and we should not interpose.
+  if (emb.pipeline) return;
+
+  type EmbedFn = (text: string) => Promise<{ embedding: number[] | Float32Array; dimensions: number; model: string }>;
+  let generateEmbedding: EmbedFn | null = null;
+  try {
+    const mod = (await import('./memory-initializer.js')) as unknown as { generateEmbedding?: EmbedFn };
+    generateEmbedding = mod.generateEmbedding ?? null;
+  } catch {
+    return; // can't import the rescuer — leave the mock fallback alone
+  }
+  if (!generateEmbedding) return;
+  const embed: EmbedFn = generateEmbedding;
+
+  // Probe once to confirm the rescuer actually returns real (non-zero) vectors.
+  // If our own fallback chain also dead-ends in mock embeddings, leave
+  // agentdb as-is rather than swapping one mock for another.
+  try {
+    const probe = await embed('rescue-probe');
+    const arr = probe?.embedding ? Array.from(probe.embedding as ArrayLike<number>) : [];
+    const hasSignal = arr.length > 0 && arr.some((v: number) => Math.abs(v) > 1e-9);
+    if (!hasSignal) return;
+  } catch {
+    return;
+  }
+
+  const newEmbed = async (text: string): Promise<Float32Array> => {
+    const out = await embed(text);
+    return out.embedding instanceof Float32Array
+      ? out.embedding
+      : new Float32Array((out.embedding as number[]) ?? []);
+  };
+  emb.embed = newEmbed;
+  emb.embedBatch = async (texts: string[]): Promise<Float32Array[]> =>
+    Promise.all(texts.map(t => newEmbed(t)));
+  emb.__ruvectorRescued = true;
+  _embedderPatched = true;
 }
 
 // ===== Bridge functions — match memory-initializer.ts signatures =====
