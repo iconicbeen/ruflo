@@ -191,6 +191,19 @@ grep -q "execCli(\[\s*'-y'\s*,\s*'metaharness@latest'" "$F" 2>/dev/null || \
 grep -q "cwd: opts" "$F" || miss="$miss no-cwd-passthrough"
 [[ -z "$miss" ]] && ok || bad "$miss"
 
+step "17z61. drift-from-history dispatcher round-trip in CI (iter 98)"
+miss=""
+W="$ROOT/../../.github/workflows/metaharness-ci.yml"
+grep -q "Drift-from-history dispatcher round-trip" "$W" 2>/dev/null || miss="$miss no-step-name"
+grep -q "metaharness drift-from-history" "$W" 2>/dev/null || miss="$miss no-cli-invocation"
+grep -q '"path": "file"' "$W" 2>/dev/null || miss="$miss no-path-file-assert"
+grep -q '"skippedAuditList": true' "$W" 2>/dev/null || miss="$miss no-skip-true-assert"
+grep -q "/tmp/drift-baseline.json" "$W" 2>/dev/null || miss="$miss no-baseline-path"
+# Iter-98 step lives in the metaharness-real-data job
+grep -B100 "Drift-from-history dispatcher round-trip" "$W" 2>/dev/null | grep -q "metaharness-real-data:" \
+  || miss="$miss not-in-real-data-job"
+[[ -z "$miss" ]] && ok || bad "$miss"
+
 step "17z60. weekly cron summary surfaces timing.path (iter 97)"
 miss=""
 W="$ROOT/../../.github/workflows/oia-audit-weekly.yml"

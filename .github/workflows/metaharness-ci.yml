@@ -434,3 +434,29 @@ jobs:
           echo "$OUT" | grep -q '"harnessFit"' || { echo "FAIL: score dispatcher dropped harnessFit"; exit 1; }
           echo "✓ score dispatcher emits the expected metaharness schema"
 
+      - name: Drift-from-history dispatcher round-trip with --baseline-file (iter 98)
+        # Exercises the iter-66/67 fast-path THROUGH the iter-42-fixed
+        # CLI dispatcher. Catches:
+        #   - iter-42 dispatcher flag-drop regression
+        #   - iter-67 --baseline-file synth-listResult drift
+        #   - iter-95 timing.path derivation drift
+        # The score cross-check above tests the simple path (one arg).
+        # This tests the chained-subprocess path (composes 3 scripts).
+        run: |
+          set -e
+          # Generate a fresh audit as baseline-file input
+          node plugins/ruflo-metaharness/scripts/oia-audit.mjs \
+            --dry-run --format json > /tmp/drift-baseline.json
+          # Dispatch through the CLI — exercises iter-42 flag round-trip
+          OUT=$(node v3/@claude-flow/cli/bin/cli.js metaharness drift-from-history \
+            --baseline-file /tmp/drift-baseline.json \
+            --dry-run --format json)
+          # Verify the iter-95 timing.path field surfaces with 'file'
+          echo "$OUT" | grep -q '"path": "file"' \
+            || { echo "FAIL: dispatcher did not propagate baseline-file or timing.path missing"; echo "$OUT" | head -30; exit 1; }
+          # Verify the iter-66 skip flag is true (proves the fast-path
+          # synthesizes the listResult correctly through the dispatcher)
+          echo "$OUT" | grep -q '"skippedAuditList": true' \
+            || { echo "FAIL: dispatcher fast-path bypass not active"; exit 1; }
+          echo "✓ drift-from-history dispatcher round-trip green (fast-path via CLI)"
+
